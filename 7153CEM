@@ -1,0 +1,147 @@
+import findspark
+
+findspark.init()
+findspark.find()
+
+#imported spark seccions
+import pyspark
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("Telecom Churn Prediction").getOrCreate()
+
+#loading dataset
+Telecom_data = ['C:/Users/user/Downloads/Telecom Churn Prediction/churn-bigml-20.csv','C:/Users/user/Downloads/Telecom Churn Prediction/churn-bigml-80.csv']
+#Train and test dataset
+Telecom_train = spark.read.csv(Telecom_data[1], header='true', inferSchema='true')
+Telecom_test = spark.read.csv(Telecom_data[0], header='true', inferSchema='true')
+Telecom_train.printSchema()
+
+#samples check
+print("The telecom train dataset contains {} samples.".format(Telecom_train.count()))
+print("The telecom test dataset contains {} samples.".format(Telecom_test.count()))
+
+#summary statistics
+n_featur = [t[0] for t in Telecom_train.dtypes if t[1] == 'int' or t[1] == 'double']
+print(n_featur)
+Telecom_train.describe(n_featur).toPandas().transpose()
+
+d_spam = Telecom_train.select(n_featur).sample(False, 0.10)
+print("The data contain {} samples.".format(d_spam.count()))
+
+# Correlation and pair plot
+
+import seaborn as sns
+sns.set(style="ticks")
+cor = sns.pairplot(d_spam.toPandas(), diag_kind="kde")
+pairplot = cor.fig
+pairplot.subplots_adjust(top=0.93, wspace=0.3)
+pairplot.suptitle('Telecom Churn Pairwise Plots', fontsize=14, fontweight='bold');
+
+def get_data(data_frame, removeCols):
+    data_frame= data_frame.drop(*removeCols) \
+        .withColumn("Churn", when(data_frame["Churn"] == 'true', 1.0).otherwise(0.0)) \
+        .withColumn('International plan', when(data_frame["International plan"] == 'Yes', 1.0).otherwise(0.0)) \
+        .withColumn('Voice mail plan', when(data_frame["Voice mail plan"] == 'Yes', 1.0).otherwise(0.0))
+    return data_frame
+
+from pyspark.sql.functions import split, col, round, when
+
+eliminate_Col = ['State', 'Area code', 'Total day charge', 'Total eve charge', 'Total night charge', 'Total intl charge']
+
+Telecom_train = get_data(Telecom_train, removeCols=eliminate_Col)
+Telecom_test = get_data(Telecom_test, removeCols=eliminate_Col)
+
+#final columns after removing
+import pandas as pd
+pd.DataFrame(Telecom_train.take(5), columns=Telecom_train.columns).transpose()
+
+from pyspark.ml.feature import StringIndexer, VectorIndexer, VectorAssembler
+from pyspark.ml import Pipeline
+
+def get_dummy(data_frame, digital_Cols, labelCol):
+    assemb= VectorAssembler(inputCols=digital_Cols, outputCol="features")
+    indx = StringIndexer(inputCol=labelCol, outputCol='indexedLabel')
+    feature_Indexer = VectorIndexer(inputCol="features", outputCol="indexedFeatures", maxCategories=2)
+    pipeline= Pipeline(stages = [assemb] + [indx] + [feature_Indexer])
+
+    model = pipeline.fit(data_frame)
+    data = model.transform(data_frame)
+
+    data = data.withColumn('label', col(labelCol))
+
+    return data.select('features', 'label', 'indexedFeatures', 'indexedLabel')
+
+d_stratified = Telecom_train.sampleBy('Churn', fractions={0: Telecom_train.select("Churn").where('Churn == 1').count()/  Telecom_train.select("Churn").where('Churn == 0').count(), 1: 1.0}, seed = 5323)
+
+d_stratified.groupby('Churn').count().show()
+d_vectrzd = get_dummy(Telecom_train, digital_Cols, "Churn")
+d_vector_stratified = get_dummy(d_stratified, digital_Cols, "Churn")
+data_test_vectorized = get_dummy(Telecom_test, digital_Cols, "Churn")
+d_vector_stratified.show(2, False)
+
+# K-fold cross validation
+def kfoldcrossvalidation(vect_train_data, vect_test_data, classifiers, p_Grid, numFolds, round_Level, seed):
+    names = []
+    underROC_train = []
+    underROC_test = []
+    f1_tr = []
+    f1_tst = []
+    wp_tr = []
+    wp_tst = []
+    wr_tr = []
+    wr_tst = []
+    acc_train = []
+    acc_test = []
+  binary_classifier = BinaryClassificationEvaluator(rawPredictionCol="prediction", labelCol="indexedLabel")
+
+    f1sco = MulticlassClassificationEvaluator(labelCol="indexedLabel", predictionCol="prediction", metricName="f1") 
+    wei_precision = MulticlassClassificationEvaluator(labelCol="indexedLabel", predictionCol="prediction", metricName="weightedPrecision") 
+    wei_recall = MulticlassClassificationEvaluator(labelCol="indexedLabel", predictionCol="prediction", metricName="weightedRecall") 
+    acc = MulticlassClassificationEvaluator(labelCol="indexedLabel", predictionCol="prediction", metricName="accuracy") 
+    for name, clf in classifiers:
+        cv = CrossValidator(estimator=clf, estimatorParamMaps=paramGrid, evaluator=f1sco, numFolds=numFolds, seed=seed, collectSubModels=True)
+        cvModel = cv.fit(vect_train_data)  
+        predict_train = cvModel.transform(vect_train_data)
+        predict_test = cvModel.transform(vect_test_data)
+        underROC_train.append(binary_classifier.evaluate(predict_train))
+        underROC_test.append(binary_classifier.evaluate(predict_test))
+        f1_tr.append(acc.evaluate(predict_train))
+        f1_tst.append(acc.evaluate(predict_test))
+        wp_tr.append(wei_precision.evaluate(predict_train))
+        wp_tst.append(wei_precision.evaluate(predict_test))
+        wr_tr.append(wei_recall.evaluate(predict_train))
+        wr_tst.append(wei_recall.evaluate(predict_test))
+        acc_train.append(acc.evaluate(predict_train))
+        acc_test.append(acc.evaluate(predict_test))
+        names.append(name)
+
+    cv_Results = spark.createDataFrame(zip(names, underROC_train, underROC_test, acc_train, acc_test, f1_tr, f1_tst, wp_tr, wp_tst, wr_tr, wr_tst), 
+                                       schema=['Classifier name', 'underROC_train', 'underROC_test', 'Acc_train', 'Accuracy_test', 'f1_train', 'f1_test', 'wPrecision_train', 'wPrecision_test', 'wRecall_train', 'wRecall_test'])
+  
+    for t in cv_Results.dtypes:
+        if t[1] == 'double':
+            cv_Results = cv_Results.withColumn(t[0], round(cv_Results[t[0]], round_Level))
+  
+    return cv_Results
+
+# Models 
+
+from pyspark.ml.classification import LogisticRegression, DecisionTreeClassifier, RandomForestClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+
+p_Grid = ParamGridBuilder().build()
+classifiers = []
+
+classifiers.append(('LR', LogisticRegression(labelCol='indexedLabel', featuresCol='indexedFeatures')))
+classifiers.append(('DT', DecisionTreeClassifier(labelCol='indexedLabel', featuresCol='indexedFeatures')))
+classifiers.append(('RF', RandomForestClassifier(labelCol='indexedLabel', featuresCol='indexedFeatures')))
+
+Telecom_Results = kfoldcrossvalidation(vect_train_data=data_vectorized, vect_test_data=data_test_vectorized, 
+                                classifiers=classifiers, p_Grid=p_Grid, numFolds=5, round_Level=3, seed=123)
+
+Telecom_stratified = kfoldcrossvalidation(vect_train_data=data_vectorized_stratified, 
+                                           vect_test_data=data_test_vectorized, classifiers=classifiers, 
+                                           p_Grid=p_Grid, numFolds=5, round_Level=3, seed=123)
+
+
+Telecom_Results.toPandas().set_index('Classifier name')
